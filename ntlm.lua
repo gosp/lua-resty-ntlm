@@ -134,6 +134,7 @@ local create_proxy = function(server)
     local m, err = ngx.re.match(ldap, "(.*):(.*)", "iu")
     local o = {}
     o.transactionId = 0
+    o.authorized = false
     if not err then
         o.server = m[1]
         o.port = tonumber(m[2])
@@ -187,7 +188,7 @@ local parse_session_setup_resp = function(msg, proxy)
     return true, serverSaslCreds
 end
 
-local ntlm_transaction = function(msg, proxy)
+local ntlm_transaction = function(msg, proxy, keepalive)
     local hdr, partial, length, pstart, payload
     local idx = ngx.var.connection
     local option = {pool = proxy.server .. ":" .. proxy.port .. ":" .. idx}
@@ -206,9 +207,14 @@ local ntlm_transaction = function(msg, proxy)
         payload, err, partial = sock:receive(length+pstart-6)
     end
     if err == nil then
-        sock:setkeepalive(KEEPALIVE)
+        if keepalive then
+            sock:setkeepalive(KEEPALIVE)
+        else
+            sock:close()
+        end
         return hdr .. payload
     end
+    sock:close()
     ngx.log(ngx.ERR, err)
     return nil
 end
@@ -238,7 +244,7 @@ local ntlm_handle_type1 = function(token, ldap)
     assert(proxy ~= nil)
     local msg = make_session_setup_req(token, proxy)
     ngx.log(ngx.ERR, "==start to send type1", " connection id= ", idx)
-    msg = ntlm_transaction(msg, proxy)
+    msg = ntlm_transaction(msg, proxy, true)
     if msg ~= nil then 
         ngx.log(ngx.ERR, "==end send type1")
         ok, msg = parse_session_setup_resp(msg, proxy)
@@ -260,13 +266,14 @@ local ntlm_handle_type3 = function(token)
     local username, domain = parse_ntlm_authenticate(token)
     local msg = make_session_setup_req(token, proxy)
     ngx.log(ngx.ERR, "--start to send type3", " connection id= ", idx)
-    msg = ntlm_transaction(msg, proxy)
+    msg = ntlm_transaction(msg, proxy, false)
     if msg ~= nil then
         ngx.log(ngx.ERR, "--end send type3")
         ok, msg = parse_session_setup_resp(msg, proxy)
         ngx.log(ngx.ERR, "--type3 completed")
         if ok then
             ngx.log(ngx.ERR, "auth succeed")
+            proxy.authorized = true
             ngx.header["Set-Cookie"] = "gsuid=" .. username .. "; path=/"
             return
         else
@@ -278,14 +285,26 @@ local ntlm_handle_type3 = function(token)
     ngx.exit(status)
 end
 
-function _M.negotiate(ldap)
-    ngx.log(ngx.ERR, "==> new request coming")
+local isAuthorized = function()
     local user = ngx.var["cookie_gsuid"]
+    local idx = ngx.var.connection
+    local proxy = cache[idx]
     if user ~= nil then
-        local idx = ngx.var.connection
-        if cache[idx] ~= nil then
+        if proxy ~= nil then
             cache[idx] = nil
         end
+        return true
+    end
+    if proxy ~= nil and proxy.authorized == true then
+        return true
+    end
+    return false
+end
+
+function _M.negotiate(ldap)
+    ngx.log(ngx.ERR, "==> new request coming")
+    local ok = isAuthorized()
+    if ok then
         return
     end
     local message = ngx.req.get_headers()["Authorization"]
