@@ -1,7 +1,9 @@
 local struct = require("struct")
 local iconv = require("iconv")
+local aes = require("resty.aes")
 local NTLMSSP = "NTLMSSP\0"
 local NTLMHEADER = "NTLM "
+local BEARER = "Bearer "
 local KEEPALIVE = 30000
 local _M = {
     _VERSION = "0.1"
@@ -129,8 +131,8 @@ end
 
 -- ASN1 end --
 
-local create_proxy = function(server)
-    local ldap = string.sub(server, string.len("ldap://") + 1)
+local create_proxy = function()
+    local ldap = string.sub(ngx.ctx.ldap, string.len("ldap://") + 1)
     local m, err = ngx.re.match(ldap, "(.*):(.*)", "iu")
     local o = {}
     o.transactionId = 0
@@ -192,7 +194,6 @@ local ntlm_transaction = function(msg, proxy, keepalive)
     local hdr, partial, length, pstart, payload
     local idx = ngx.var.connection
     local option = {pool = proxy.server .. ":" .. proxy.port .. ":" .. idx}
-    ngx.log(ngx.ERR, "next to connect ldap on ", option.pool)
     local sock, err = ngx.socket.connect(proxy.server, proxy.port, option)
     if err then
         ngx.log(ngx.ERR, "Connect fail: " .. err, " server: ", proxy.server, " port: ", proxy.port)
@@ -219,8 +220,8 @@ local ntlm_transaction = function(msg, proxy, keepalive)
     return nil
 end
 
-local decode_http_authorization_header = function(msg)
-    local m = string.sub(msg, string.len(NTLMHEADER) + 1)
+local decode_http_authorization_header = function(msg, header)
+    local m = string.sub(msg, string.len(header) + 1)
     return ngx.decode_base64(m)
 end
 
@@ -232,13 +233,13 @@ local ntlm_message_type = function(msg)
     return -1
 end
 
-local ntlm_handle_type1 = function(token, ldap)
+local ntlm_handle_type1 = function(token)
     local ok
     local status = ngx.HTTP_INTERNAL_SERVER_ERROR
     local idx = ngx.var.connection
     local proxy = cache[idx]
     if proxy == nil then
-        proxy = create_proxy(ldap)
+        proxy = create_proxy()
         cache[idx] = proxy
     end
     assert(proxy ~= nil)
@@ -274,7 +275,15 @@ local ntlm_handle_type3 = function(token)
         if ok then
             ngx.log(ngx.ERR, "auth succeed")
             proxy.authorized = true
-            ngx.header["Set-Cookie"] = "gsuid=" .. username .. "; path=/"
+            proxy.username = username
+            proxy.domain = domain
+            -- update req headers
+            ngx.req.set_header('X-Ntlm-Username', username)
+            ngx.req.set_header('X-Ntlm-Domain', domain)
+            -- update resp header
+            local encryptor = aes:new(ngx.ctx.aes_key)
+            local bearer = domain .. "\\" .. username
+            ngx.header["Authorization"] = BEARER .. ngx.encode_base64(encryptor:encrypt(bearer))
             return
         else
             ngx.log(ngx.ERR, "auth fails. try again")
@@ -285,41 +294,48 @@ local ntlm_handle_type3 = function(token)
     ngx.exit(status)
 end
 
-local isAuthorized = function()
-    local user = ngx.var["cookie_gsuid"]
+local isAuthorized = function(message)
     local idx = ngx.var.connection
     local proxy = cache[idx]
-    if user ~= nil then
-        if proxy ~= nil then
-            cache[idx] = nil
+    if message ~= nil and  string.sub(message, 1, string.len(BEARER)) == BEARER then
+        local msg = decode_http_authorization_header(message, BEARER)
+        local decryptor = aes:new(ngx.ctx.aes_key)
+        local bearer = decryptor:decrypt(msg)
+        if bearer ~= nil then 
+            local m, err = ngx.re.match(bearer, "(.+)\\(.+)", "iu")
+            if not err then
+                ngx.req.set_header('X-Ntlm-Username', m[2])
+                ngx.req.set_header('X-Ntlm-Domain', m[1])
+                if proxy ~= nil then
+                    cache[idx] = nil
+                end
+                return true
+            end
         end
-        return true
     end
     if proxy ~= nil and proxy.authorized == true then
+        ngx.req.set_header('X-Ntlm-Username', proxy.username)
+        ngx.req.set_header('X-Ntlm-Domain', proxy.domain)
         return true
     end
     return false
 end
 
-function _M.negotiate(ldap)
-    ngx.log(ngx.ERR, "==> new request coming")
-    local ok = isAuthorized()
+function _M.negotiate()
+    local message = ngx.var.http_Authorization
+    local ok = isAuthorized(message)
     if ok then
         return
     end
-    local message = ngx.req.get_headers()["Authorization"]
     if message ~= nil and string.sub(message, 1, string.len(NTLMHEADER)) == NTLMHEADER then
-        assert(ldap ~= nil and string.lower(string.sub(ldap, 1, string.len("ldap://"))) == "ldap://")
-        local msg = decode_http_authorization_header(message)
+        local msg = decode_http_authorization_header(message, NTLMHEADER)
         local ntlm_type = ntlm_message_type(msg)
-        ngx.log(ngx.ERR, tohex(msg))
         if ntlm_type == 1 then
-            return ntlm_handle_type1(msg, ldap)
+            return ntlm_handle_type1(msg)
         elseif ntlm_type == 3 then
             return ntlm_handle_type3(msg)
-        end
+        end 
     end
-    ngx.log(ngx.ERR, "= start 401 process =")
     ngx.header["WWW-Authenticate"] = "NTLM"
     ngx.exit(ngx.HTTP_UNAUTHORIZED)
 end
