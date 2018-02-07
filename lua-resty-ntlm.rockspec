@@ -2,7 +2,7 @@ package = 'lua-resty-ntlm'
 version = '0.1-2'
 source = {
   url = 'git://github.com/gosp/lua-resty-ntlm',
-  tag = "v0.1"
+  tag = "v0.2"
 }
 description = {
   summary = 'NTLM for OpenResty (nginx-lua-module)',

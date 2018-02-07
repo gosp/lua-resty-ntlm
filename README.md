@@ -14,11 +14,14 @@ The project is inspired by [express-ntlm](https://github.com/einfallstoll/expres
 + save `ntlm.lua` into `/usr/local/openresty/site/lualib`
 + add the following code to `/usr/local/openresty/nginx/conf/nginx.conf`: 
     ```
+        lua_shared_dict ntlm_cache 10m;
+        keepalive_timeout  35;
+        ... ...
         access_by_lua_block {
-            local ntlm = require('ntlm')
-            ngx.ctx.ldap = "ldap://domain.net:389"
-            ngx.ctx.aes_key = "gjkdgYQ"
-            ntlm.negotiate()
+            local cache = ngx.shared.ntlm_cache
+            require('ntlm').negotiate("ldap://domain.net:389", cache, 10)
+            -- cache is shared DICT
+            -- timeout is less than keepalive
         }
     ```
 + restart nginx service: `sudo service openresty restart`
